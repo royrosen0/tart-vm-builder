@@ -21,7 +21,8 @@ packer {
 # =============================================================================
 source "tart-cli" "tahoe-android" {
   # Clone from the base macOS image with Xcode pre-installed
-  from_oci       = var.base_image
+  # vm_base_name can be a local VM or a remote OCI image (e.g., ghcr.io/cirruslabs/macos-sequoia-xcode:latest)
+  vm_base_name   = var.base_image
   vm_name        = var.vm_name
   
   # Resource allocation for faster builds
@@ -36,9 +37,6 @@ source "tart-cli" "tahoe-android" {
   
   # Disable VNC as we don't need graphical access during build
   headless       = true
-  
-  # Run the VM during provisioning
-  run_packer_tag = "packer-build"
 }
 
 # =============================================================================
