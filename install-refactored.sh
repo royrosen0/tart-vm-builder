@@ -28,11 +28,12 @@ readonly SSH_CONFIG="/etc/ssh/sshd_config"
 readonly SERVICES_FILE="/etc/services"
 
 # Installation options
-readonly INSTALL_ANDROID="${INSTALL_ANDROID:-true}"
-readonly INSTALL_XCODE="${INSTALL_XCODE:-true}"
-readonly INSTALL_APPIUM="${INSTALL_APPIUM:-true}"
-readonly CONFIGURE_SSH="${CONFIGURE_SSH:-true}"
-readonly CONFIGURE_POWER="${CONFIGURE_POWER:-true}"
+# REMOVED 'readonly' to allow command line arguments to override these
+INSTALL_ANDROID="${INSTALL_ANDROID:-true}"
+INSTALL_XCODE="${INSTALL_XCODE:-true}"
+INSTALL_APPIUM="${INSTALL_APPIUM:-true}"
+CONFIGURE_SSH="${CONFIGURE_SSH:-true}"
+CONFIGURE_POWER="${CONFIGURE_POWER:-true}"
 
 # Logging configuration
 readonly LOG_FILE="${LOG_FILE:-/tmp/${SCRIPT_NAME%.sh}.log}"
