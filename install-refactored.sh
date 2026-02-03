@@ -1,7 +1,7 @@
 #!/bin/bash
-# macOS Development Environment Setup Script (The "Stop Breaking Things" Edition)
-# Version: 2.2.0-stable
-# Description: Setup for iOS/Android. Now with Network config that doesn't hang CI.
+# macOS Setup Script: The "No More Clicking" Edition
+# Version: 3.2.0-automated-hatred
+# Author: Roy
 
 set -euo pipefail
 
@@ -9,43 +9,39 @@ set -euo pipefail
 # CONFIGURATION
 # ============================================================================
 
-readonly SCRIPT_VERSION="2.2.0"
 readonly SCRIPT_NAME="$(basename "$0")"
+readonly LOG_FILE="${LOG_FILE:-/tmp/mac_setup_full.log}"
 
 # Paths
 readonly ANDROID_SDK_ROOT="/Users/Shared/dev/sdk"
-readonly ANDROID_HOME="$ANDROID_SDK_ROOT"
 readonly NPM_PREFIX="$HOME/.npm-global"
-readonly SSH_KEY_PATH="$HOME/.ssh/id_ed25519"
-readonly NETWORK_CONFIG_FILE="$HOME/.network_config"
+readonly NETWORK_BACKUP="$HOME/.network_restore_order"
+readonly DOCK_BACKUP_DIR="$HOME"
+readonly PROVISIONING_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
 
-# Settings (ENV override supported)
+# Network Defaults (102 Env)
+readonly NET_SUBNET="172.21.102"
+readonly NET_ROUTER="172.21.102.254"
+readonly NET_MASK="255.255.255.0"
+readonly NET_DNS=("172.21.104.236" "172.22.80.12" "172.22.80.11")
+
+# Toggles (Override with ENV vars)
 export INSTALL_ANDROID="${INSTALL_ANDROID:-true}"
 export INSTALL_XCODE="${INSTALL_XCODE:-true}"
 export INSTALL_APPIUM="${INSTALL_APPIUM:-true}"
-export CONFIGURE_SSH="${CONFIGURE_SSH:-true}"
-export CONFIGURE_POWER="${CONFIGURE_POWER:-true}"
-export CONFIGURE_NETWORK="${CONFIGURE_NETWORK:-true}"
+export CONFIGURE_SYSTEM="${CONFIGURE_SYSTEM:-true}"
+export CONFIGURE_NETWORK_IP="${CONFIGURE_NETWORK_IP:-false}" # Set to true to force static IP setup
 export OFFLINE_MODE="${OFFLINE_MODE:-false}"
-
-# Versions
-readonly JAVA_VERSION="${JAVA_VERSION:-openjdk@17}"
-readonly TARGET_XCODE_VERSION="${TARGET_XCODE_VERSION:-latest}"
-
-# Logging
-readonly LOG_FILE="${LOG_FILE:-/tmp/${SCRIPT_NAME%.sh}.log}"
-readonly LOG_LEVEL="${LOG_LEVEL:-INFO}" 
-
-# Colors
-readonly C_RESET='\033[0m'
-readonly C_RED='\033[0;31m'
-readonly C_YELLOW='\033[0;33m'
-readonly C_GREEN='\033[0;32m'
-readonly C_BLUE='\033[0;34m'
 
 # ============================================================================
 # LOGGING
 # ============================================================================
+
+readonly C_RESET='\033[0m'
+readonly C_RED='\033[0;31m'
+readonly C_GREEN='\033[0;32m'
+readonly C_YELLOW='\033[0;33m'
+readonly C_BLUE='\033[0;34m'
 
 mkdir -p "$(dirname "$LOG_FILE")"
 touch "$LOG_FILE"
@@ -55,79 +51,53 @@ log() {
     local color=$2
     shift 2
     local msg="$*"
-    local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
-    echo "[$timestamp] [$level] $msg" >> "$LOG_FILE"
-    
-    if [[ "$LOG_LEVEL" == "ERROR" ]] && [[ "$level" != "ERROR" ]]; then return; fi
+    local ts="$(date '+%H:%M:%S')"
+    echo "[$ts] [$level] $msg" >> "$LOG_FILE"
     echo -e "${color}[$level]${C_RESET} $msg" >&2
 }
 
-log_info()    { log "INFO"    "$C_BLUE"   "$@"; }
-log_warn()    { log "WARN"    "$C_YELLOW" "$@"; }
-log_error()   { log "ERROR"   "$C_RED"    "$@"; }
-log_success() { log "SUCCESS" "$C_GREEN"  "$@"; }
+info()    { log "INFO"    "$C_BLUE"   "$@"; }
+success() { log "OK"      "$C_GREEN"  "$@"; }
+warn()    { log "WARN"    "$C_YELLOW" "$@"; }
+error()   { log "ERROR"   "$C_RED"    "$@"; }
+fatal()   { error "$@"; exit 1; }
 
 # ============================================================================
-# ERROR TRAPPING
+# TRAPS & CLEANUP
 # ============================================================================
-
-error_handler() {
-    local line=$1
-    local code=$2
-    log_error "Script failed at line $line with exit code $code"
-    exit "$code"
-}
-trap 'error_handler $LINENO $?' ERR
 
 cleanup() {
     local exit_code=$?
     
-    # Kill sudo keepalive
+    # Kill Sudo Keepalive
     if [[ -n "${KEEPALIVE_PID:-}" ]]; then
         kill "$KEEPALIVE_PID" 2>/dev/null || true
     fi
 
-    # NETWORK RESTORE SAFEGUARD
-    # Only attempt restore if we messed with it AND we still have sudo access
-    if [[ "$CONFIGURE_NETWORK" == "true" ]] && sudo -n true 2>/dev/null; then
-        restore_network_connection
-    elif [[ "$CONFIGURE_NETWORK" == "true" ]]; then
-        log_warn "Cannot restore network settings: Sudo session expired. Fix it manually."
-    fi
-
-    if [[ $exit_code -eq 0 ]]; then
-        log_success "Script completed successfully."
+    if [[ $exit_code -ne 0 ]]; then
+        error "Script failed. Check logs at $LOG_FILE"
     else
-        log_error "Script failed. Check $LOG_FILE"
+        success "Script finished. Verify networking and reboot."
     fi
 }
 trap cleanup EXIT
 
 # ============================================================================
-# PRE-FLIGHT CHECKS
+# SANITY CHECKS
 # ============================================================================
 
-validate_system() {
-    log_info "Validating system..."
-    
-    [[ $EUID -eq 0 ]] && { log_error "Do not run as root."; exit 1; }
-    
-    # Check FDA (Full Disk Access) - CRITICAL for systemsetup/networksetup
+check_environment() {
+    info "Validating environment..."
+    [[ $EUID -eq 0 ]] && fatal "Don't run as root."
+
     if ! ls "/Library/Application Support/com.apple.TCC/TCC.db" >/dev/null 2>&1; then
-        log_warn "----------------------------------------------------------------"
-        log_warn "MISSING FULL DISK ACCESS (FDA)"
-        log_warn "Your terminal does not have Full Disk Access."
-        log_warn "Network config and Power settings WILL FAIL or PROMPT interactively."
-        log_warn "Go to System Settings > Privacy > Full Disk Access -> Add Terminal."
-        log_warn "----------------------------------------------------------------"
-        sleep 2
+        warn "MISSING FULL DISK ACCESS (FDA). System settings WILL FAIL."
+        read -p "Press Enter to continue (risky) or Ctrl+C to abort..."
     fi
 
-    if [[ "$OFFLINE_MODE" == "false" ]]; then
-        if ! ping -c 1 -W 2 8.8.8.8 &>/dev/null; then
-            log_warn "No internet access. Switching to OFFLINE_MODE automatically."
-            export OFFLINE_MODE="true"
-        fi
+    if ! ping -c 1 -W 2 8.8.8.8 &>/dev/null; then
+        warn "No internet. Switching to OFFLINE mode."
+        export OFFLINE_MODE="true"
     fi
 }
 
@@ -137,202 +107,262 @@ setup_sudo_keepalive() {
     KEEPALIVE_PID=$!
 }
 
-# ============================================================================
-# NETWORK CONFIGURATION (The "Safe" Version)
-# ============================================================================
-
-restore_network_connection() {
-    # Only run if we actually saved a restore point
-    [[ ! -f "$HOME/.network_restore.order" ]] && return 0
-
-    log_info "Attempting network restoration..."
-    
-    local original_order
-    original_order=$(cat "$HOME/.network_restore.order")
-    
-    # This is risky logic, Roy. But I'll leave your restoration attempt in.
-    # Just wrapped in protection so it doesn't crash the trap.
-    if [[ -n "$original_order" ]]; then
-        # Actually, networksetup output is human readable, not machine readable.
-        # Parsing it back into arguments is a nightmare. 
-        # Instead, we just ensure Ethernet is top if possible.
-        log_info "Resetting priority to internal defaults..."
-    fi
-    
-    # Simple fallback: Just ensure we didn't leave the machine offline
-    if ! ping -c 1 -W 2 8.8.8.8 &>/dev/null; then
-        log_warn "Network seems dead. You might need to manually fix Service Order in Settings."
-    fi
-    
-    rm -f "$HOME/.network_restore.order" 2>/dev/null || true
-}
-
-configure_network_interfaces() {
-    [[ "$CONFIGURE_NETWORK" != "true" ]] && return 0
-    
-    log_info "Configuring Network Interfaces..."
-    
-    # 1. Save current state
-    networksetup -listnetworkserviceorder > "$HOME/.network_restore.order"
-    
-    # 2. Get Services (Cleaned)
-    local services=()
-    while IFS= read -r line; do
-        # Strip the asterisk if disabled
-        local sname="${line#\*}"
-        [[ -n "$sname" ]] && services+=("$sname")
-    done < <(networksetup -listallnetworkservices | tail -n +2 | grep -v "An asterisk")
-    
-    local internet_service=""
-    local internal_service=""
-    
-    # 3. Selection Logic
-    if [[ -t 0 ]]; then
-        # INTERACTIVE MODE
-        echo "Select primary INTERNET service (WiFi):"
-        select opt in "${services[@]}" "Skip"; do
-            [[ "$opt" == "Skip" ]] && break
-            [[ -n "$opt" ]] && internet_service="$opt" && break
-            echo "Pick a number, genius."
-        done
-        
-        echo "Select primary INTERNAL service (Ethernet):"
-        select opt in "${services[@]}" "Skip"; do
-             [[ "$opt" == "Skip" ]] && break
-             [[ -n "$opt" ]] && internal_service="$opt" && break
-             echo "Pick a number."
-        done
-    else
-        # HEADLESS / CI MODE (Auto-detect)
-        log_info "Non-interactive mode detected. Auto-selecting interfaces..."
-        
-        # Naive matching
-        for s in "${services[@]}"; do
-            if [[ "$s" =~ "Wi-Fi" ]] || [[ "$s" =~ "WiFi" ]]; then
-                internet_service="$s"
-            fi
-            if [[ "$s" =~ "Ethernet" ]] || [[ "$s" =~ "Thunderbolt" ]]; then
-                internal_service="$s"
-            fi
-        done
-    fi
-    
-    # 4. Apply Order (Internal > Internet > Rest)
-    local new_order=()
-    [[ -n "$internal_service" ]] && new_order+=("$internal_service")
-    [[ -n "$internet_service" ]] && new_order+=("$internet_service")
-    
-    # Add the rest
-    for s in "${services[@]}"; do
-        if [[ "$s" != "$internal_service" && "$s" != "$internet_service" ]]; then
-            new_order+=("$s")
-        fi
-    done
-    
-    if [[ ${#new_order[@]} -gt 0 ]]; then
-        log_info "Setting network service order: ${new_order[*]}"
-        # We invoke sudo networksetup. This relies on FDA.
-        sudo networksetup -ordernetworkservices "${new_order[@]}" || log_warn "Failed to set network order. Check Permissions."
-    fi
-    
-    # Save for user reference
-    echo "INTERNET_SERVICE=\"$internet_service\"" > "$NETWORK_CONFIG_FILE"
-    echo "INTERNAL_SERVICE=\"$internal_service\"" >> "$NETWORK_CONFIG_FILE"
-}
-
-# ============================================================================
-# INSTALL HELPERS
-# ============================================================================
-
-command_exists() { command -v "$1" >/dev/null 2>&1; }
-
 brew_ensure() {
     [[ "$OFFLINE_MODE" == "true" ]] && return 0
-    local packages=("$@")
-    for p in "${packages[@]}"; do
-        if ! brew list --versions "$p" >/dev/null 2>&1; then
-            log_info "Installing $p..."
-            # Retry loop for flaky network
-            local count=0
-            until brew install "$p" || [[ $count -eq 3 ]]; do
-                log_warn "Brew install $p failed. Retrying..."
-                ((count++))
-                sleep 2
-            done
-            [[ $count -eq 3 ]] && return 1
-        fi
-    done
-    return 0
-}
-
-# ============================================================================
-# CORE SETUP
-# ============================================================================
-
-setup_homebrew() {
-    [[ "$OFFLINE_MODE" == "true" ]] && return 0
-    if ! command_exists brew; then
-        log_info "Installing Homebrew..."
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    if ! brew list --versions "$1" >/dev/null 2>&1; then
+        info "Installing $1..."
+        brew install "$1"
     fi
-    # Eval shellenv
-    if [[ -x /opt/homebrew/bin/brew ]]; then eval "$(/opt/homebrew/bin/brew shellenv)"; fi
-    if [[ -x /usr/local/bin/brew ]]; then eval "$(/usr/local/bin/brew shellenv)"; fi
 }
 
-setup_android_sdk() {
+# ============================================================================
+# SYSTEM CONFIGURATION
+# ============================================================================
+
+configure_ssh() {
+    [[ "$CONFIGURE_SYSTEM" != "true" ]] && return 0
+    info "Configuring SSH on port 20022..."
+    
+    local p="20022"
+    local services="/etc/services"
+    local sshd="/etc/ssh/sshd_config"
+
+    # Patch /etc/services
+    if grep -qE '^ssh[[:space:]]+22/' "$services"; then
+        sudo cp "$services" "$services.bak"
+        sudo sed -i '' -E "s/^(ssh[[:space:]]+)22\//\1${p}\//" "$services"
+        success "Patched /etc/services"
+    fi
+
+    # Patch sshd_config
+    if ! sudo grep -qE "^[#]*[[:space:]]*Port[[:space:]]+${p}\b" "$sshd"; then
+        echo "Port ${p}" | sudo tee -a "$sshd" >/dev/null
+        success "Patched sshd_config"
+    fi
+
+    sudo systemsetup -setremotelogin on >/dev/null 2>&1 || warn "Failed to enable SSH (FDA?)"
+    
+    if [[ ! -f "$HOME/.ssh/id_ed25519" ]]; then
+        ssh-keygen -t ed25519 -f "$HOME/.ssh/id_ed25519" -C "dev@$(hostname)" -N ""
+    fi
+}
+
+configure_keychain_security() {
+    [[ "$CONFIGURE_SYSTEM" != "true" ]] && return 0
+    info "Unlocking keychain for codesigning tools..."
+
+    # This prevents "Always Allow" popups. 
+    # Requires the user password. If this is headless, you need to pipe it in or set ENV.
+    
+    # We assume the login keychain password is the same as sudo.
+    # If not, this fails, and you deserve it.
+    
+    local kc_path="$HOME/Library/Keychains/login.keychain-db"
+    
+    # Grant access to codesign, productbuild, etc.
+    # We use 'security set-key-partition-list'.
+    # Warning: This asks for a password if not provided.
+    
+    echo "Need keychain password to authorize codesign tools:"
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$(whoami)" "$kc_path" || \
+        warn "Failed to set partition list. You will get popups."
+        
+    success "Keychain authorized for codesigning."
+}
+
+configure_power() {
+    [[ "$CONFIGURE_SYSTEM" != "true" ]] && return 0
+    info "Configuring Power Management..."
+    sudo pmset -a sleep 0 displaysleep 0 disksleep 0 powernap 0
+    defaults -currentHost write com.apple.screensaver idleTime -int 0
+    success "Power settings applied."
+}
+
+configure_dock() {
+    [[ "$CONFIGURE_SYSTEM" != "true" ]] && return 0
+    info "Resetting Dock..."
+    defaults write com.apple.dock persistent-apps -array
+    defaults write com.apple.dock persistent-others -array
+    defaults write com.apple.dock show-recents -bool false
+    
+    # Minimal Dock
+    local apps=("/System/Applications/Utilities/Terminal.app" "/Applications/Safari.app")
+    for app in "${apps[@]}"; do
+        [[ -d "$app" ]] && defaults write com.apple.dock persistent-apps -array-add "<dict><key>tile-data</key><dict><key>file-data</key><dict><key>_CFURLString</key><string>$app</string><key>_CFURLStringType</key><integer>0</integer></dict></dict></dict>"
+    done
+    
+    killall Dock || true
+}
+
+configure_static_ip() {
+    # Only run if explicitly asked, or if we are interactive and want to.
+    [[ "$CONFIGURE_NETWORK_IP" != "true" ]] && return 0
+    
+    info "Configuring Static IP for 102 Environment..."
+    
+    local eth_service
+    eth_service=$(networksetup -listallnetworkservices | grep -E "Ethernet|Thunderbolt|LAN" | head -n 1 | sed 's/^\*//')
+    
+    if [[ -z "$eth_service" ]]; then
+        error "No Ethernet service found. Skipping static IP setup."
+        return 0
+    fi
+    
+    echo "Detected Service: $eth_service"
+    echo "Subnet: $NET_SUBNET.X"
+    
+    # Interactive prompt for the octet
+    read -p "Enter the last octet for this machine (e.g. 50): " octet
+    
+    if [[ ! "$octet" =~ ^[0-9]+$ ]]; then
+        error "Invalid octet. Skipping."
+        return
+    fi
+    
+    local ip="${NET_SUBNET}.${octet}"
+    info "Setting IP to $ip on $eth_service..."
+    
+    sudo networksetup -setmanual "$eth_service" "$ip" "$NET_MASK" "$NET_ROUTER"
+    sudo networksetup -setdnsservers "$eth_service" "${NET_DNS[@]}"
+    
+    success "Network configured. You may lose connectivity if you are on the wrong VLAN."
+}
+
+configure_tmp_and_dns() {
+    [[ "$CONFIGURE_SYSTEM" != "true" ]] && return 0
+    sudo chmod -R 1777 /private/tmp /private/var/tmp || warn "Failed to chmod tmp"
+    sudo dscacheutil -flushcache >/dev/null 2>&1 || true
+    sudo killall -HUP mDNSResponder >/dev/null 2>&1 || true
+}
+
+configure_remote_management() {
+    [[ "$CONFIGURE_SYSTEM" != "true" ]] && return 0
+    info "Enabling Remote Management (ARD)..."
+    local kickstart="/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart"
+    [[ -x "$kickstart" ]] && sudo "$kickstart" -activate -configure -access -on -users admin -privs -all -restart -agent -menu
+}
+
+# ============================================================================
+# INSTALLATION
+# ============================================================================
+
+install_core() {
+    [[ "$OFFLINE_MODE" == "true" ]] && return 0
+    info "Installing Core Tools..."
+    
+    if ! command -v brew >/dev/null; then
+        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        eval "$(/opt/homebrew/bin/brew shellenv)"
+    fi
+
+    local formulas=(node jq aria2 maven gradle tree htop carthage swiftlint ios-deploy sshpass)
+    for f in "${formulas[@]}"; do brew_ensure "$f"; done
+
+    brew_ensure openjdk@17
+    sudo ln -sfn /opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk /Library/Java/JavaVirtualMachines/openjdk-17.jdk 2>/dev/null || true
+    
+    git config --global credential.helper osxkeychain
+}
+
+setup_ruby() {
+    [[ "$OFFLINE_MODE" == "true" ]] && return 0
+    info "Setting up Ruby/xcpretty..."
+    local gem_bin="$(ruby -rrubygems -e 'print Gem.user_dir')/bin"
+    export PATH="$gem_bin:$PATH"
+    if ! command -v xcpretty >/dev/null; then
+        gem install --user-install xcpretty --no-document || warn "xcpretty failed"
+    fi
+}
+
+install_provisioning_profiles() {
+    [[ "$CONFIGURE_SYSTEM" != "true" ]] && return 0
+    info "Scanning for Provisioning Profiles in ~/Downloads..."
+    
+    mkdir -p "$PROVISIONING_DIR"
+    
+    # If you put profiles in Downloads, we scavenge them.
+    if ls "$HOME/Downloads/"*.mobileprovision >/dev/null 2>&1; then
+        cp "$HOME/Downloads/"*.mobileprovision "$PROVISIONING_DIR/"
+        success "Imported profiles from Downloads."
+    else
+        warn "No profiles found in Downloads. You'll need to drag them in manually."
+    fi
+}
+
+install_android() {
     [[ "$INSTALL_ANDROID" != "true" ]] && return 0
-    [[ "$OFFLINE_MODE" == "true" ]] && { log_warn "Skipping Android SDK (Offline)"; return 0; }
+    [[ "$OFFLINE_MODE" == "true" ]] && return 0
+    info "Setting up Android SDK..."
     
-    log_info "Setting up Android SDK..."
     sudo mkdir -p "$ANDROID_SDK_ROOT"
-    sudo chown -R "$(whoami)":staff "$ANDROID_SDK_ROOT"
-    
-    # Basic tools install via brew first
+    sudo chown -R "$(whoami):staff" "$ANDROID_SDK_ROOT"
     brew_ensure android-commandlinetools
     
-    local cmd_tools="$(brew --prefix)/share/android-commandlinetools"
-    if [[ -d "$cmd_tools" ]]; then
+    local brew_tools="$(brew --prefix)/share/android-commandlinetools"
+    [[ -d "$brew_tools" ]] && {
         mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools/latest"
-        rsync -a "$cmd_tools/" "$ANDROID_SDK_ROOT/cmdline-tools/latest/" --ignore-existing
-    fi
-    
+        rsync -a "$brew_tools/" "$ANDROID_SDK_ROOT/cmdline-tools/latest/" --ignore-existing
+    }
+
     export PATH="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:$PATH"
-    
-    # This is the heavy part
-    log_info "Downloading Android Components..."
     yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" --licenses >/dev/null 2>&1 || true
-    yes | sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "emulator" >/dev/null 2>&1 || true
+    sdkmanager --sdk_root="$ANDROID_SDK_ROOT" "platform-tools" "emulator" "platforms;android-34" "build-tools;34.0.0"
 }
 
-setup_xcode() {
+install_xcode() {
     [[ "$INSTALL_XCODE" != "true" ]] && return 0
-    [[ "$OFFLINE_MODE" == "true" ]] && { log_warn "Skipping Xcode (Offline)"; return 0; }
+    [[ "$OFFLINE_MODE" == "true" ]] && return 0
+    info "Checking Xcode..."
+    brew_ensure xcodes
+
+    local ver=$(xcodes list | grep -vE 'Beta|RC' | sort -rV | head -n1 | awk '{print $1}')
+    local app_path=""
     
-    log_info "Setting up Xcode..."
+    if [[ -d "/Applications/Xcode-$ver.app" ]]; then app_path="/Applications/Xcode-$ver.app"; fi
     
-    local install_ver
-    if [[ "$TARGET_XCODE_VERSION" == "latest" ]]; then
-         install_ver=$(xcodes list | grep -vE 'Beta|RC' | sort -rV | head -n1 | awk '{print $1}')
-    else
-         install_ver="$TARGET_XCODE_VERSION"
+    if [[ -z "$app_path" ]]; then
+        info "Installing Xcode $ver (Unxip)..."
+        xcodes install "$ver" --experimental-unxip
+        app_path="/Applications/Xcode-$ver.app"
     fi
     
-    if xcodes installed | grep -q "$install_ver"; then
-        log_success "Xcode $install_ver already installed."
-    else
-        log_info "Installing Xcode $install_ver (Prepare for wait)..."
-        # SERIAL EXECUTION ONLY
-        sudo xcodes install "$install_ver" --experimental-unxip
+    if [[ -d "$app_path" ]]; then
+        sudo xcode-select -s "$app_path/Contents/Developer"
+        sudo xcodebuild -runFirstLaunch >/dev/null 2>&1 || true
     fi
+}
+
+install_appium() {
+    [[ "$INSTALL_APPIUM" != "true" ]] && return 0
+    [[ "$OFFLINE_MODE" == "true" ]] && return 0
+    info "Setting up Appium..."
     
-    # Switch
-    local app_path="/Applications/Xcode.app"
-    [[ -d "/Applications/Xcode-$install_ver.app" ]] && app_path="/Applications/Xcode-$install_ver.app"
-    
-    sudo xcode-select -s "$app_path/Contents/Developer"
-    sudo xcodebuild -license accept >/dev/null 2>&1 || true
-    sudo xcodebuild -runFirstLaunch >/dev/null 2>&1 || true
+    mkdir -p "$NPM_PREFIX"
+    npm config set prefix "$NPM_PREFIX"
+    export PATH="$NPM_PREFIX/bin:$PATH"
+
+    npm install -g appium appium-doctor
+    appium driver install xcuitest 2>/dev/null || true
+    appium driver install uiautomator2 2>/dev/null || true
+}
+
+configure_shell() {
+    info "Patching .zshrc..."
+    local zshrc="$HOME/.zshrc"
+    touch "$zshrc"
+    if ! grep -q "Roy-Script-Managed" "$zshrc"; then
+        cat <<EOT >> "$zshrc"
+
+# --- Roy-Script-Managed Config ---
+export ANDROID_HOME="$ANDROID_SDK_ROOT"
+export ANDROID_SDK_ROOT="$ANDROID_SDK_ROOT"
+export PATH="\$ANDROID_SDK_ROOT/cmdline-tools/latest/bin:\$ANDROID_SDK_ROOT/platform-tools:\$PATH"
+export PATH="$NPM_PREFIX/bin:\$PATH"
+export PATH="\$(ruby -rrubygems -e 'print Gem.user_dir')/bin:\$PATH"
+export JAVA_HOME="/Library/Java/JavaVirtualMachines/openjdk-17.jdk/Contents/Home"
+# ---------------------------------
+EOT
+    fi
 }
 
 # ============================================================================
@@ -340,35 +370,29 @@ setup_xcode() {
 # ============================================================================
 
 main() {
-    log_info "Starting setup. Mode: ${OFFLINE_MODE/true/OFFLINE}"
-    
-    validate_system
+    check_environment
     setup_sudo_keepalive
     
-    # 1. Network Config (Do this first so we have stable net)
-    configure_network_interfaces
-
-    # 2. Base
-    setup_homebrew
-    brew_ensure jq node xcodes maven aria2
+    # Configs
+    configure_power
+    configure_ssh
+    configure_dock
+    configure_keychain_security # Added this to kill the popups
+    configure_static_ip         # Added this so you don't have to type IPs manually
+    configure_tmp_and_dns
+    configure_remote_management
     
-    # 3. Heavy Lifting - SEQUENTIAL. DO NOT MAKE THIS PARALLEL.
-    setup_android_sdk
-    setup_xcode
+    # Installs
+    install_core
+    setup_ruby
+    install_provisioning_profiles # Attempts to import from Downloads
+    install_android
+    install_xcode
+    install_appium
     
-    # 4. System Configs
-    if [[ "$CONFIGURE_POWER" == "true" ]]; then
-        log_info "Setting power management..."
-        sudo pmset -a sleep 0
-        sudo pmset -a displaysleep 0
-    fi
+    configure_shell
     
-    if [[ "$CONFIGURE_SSH" == "true" ]]; then
-        log_info "Configuring SSH..."
-        sudo systemsetup -setremotelogin on >/dev/null 2>&1 || log_warn "SSH enable failed (FDA missing?)"
-    fi
-
-    log_success "Done. Restart your terminal."
+    success "Done. Restart your terminal."
 }
 
 main "$@"
